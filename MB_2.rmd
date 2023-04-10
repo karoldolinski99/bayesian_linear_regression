@@ -1,0 +1,707 @@
+---
+title: "<center>Metody Bayesowskie - projekt II</center>"
+output: 
+    html_document:
+          toc: true
+          toc_float: true
+          number_sections: true
+          css: style.css
+---
+
+<center>
+Karol Doliński, Magdalena Smalarz, Małgorzata Warczyńska
+
+Informatyka i Ekonometria
+</center>
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+ fig.width = 6,
+ fig.asp = 0.9,
+ out.width = "100%"
+)
+```
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+library(lmtest)
+library(invgamma)
+library(MCMCpack)
+library(metRology)
+library(bayestestR)
+library(fCopulae)
+library(car)
+library(dplyr)
+library(kableExtra)
+library(ggplot2)
+library(plyr)
+library(bayestestR)
+library(Metrics)
+
+```
+
+-----
+
+# Wprowadzenie
+
+Model regresji wielorakiej jest jednym z popularniejszych modeli stosowanych do opisu i predykcji wybranej cechy. Klasycznym podejściem jest estymacja modelu za pomocą Metody Najmniejszych Kwadratów. Z kolei wnioskowanie bayesowskie to metoda wnioskowania statystycznego, w której wykorzystuje się zarówno dane jak i prawdopodobieństwo _a priori_ uzyskane np. z poprzednich badań. Celem niniejszego projektu jest zastosowanie wnioskowania bayesowskiego w modelu regresji wielorakiej, a następnie porównanie otrzymanych wyników, w szczególności tych dotyczących prognoz. 
+
+# Zbiór danych
+
+Dane wykorzystane w badaniu zawierają 80 obserwacji (z czego 5 zostanie wykorzystanych do prognozy), z których każda jest opisana za pomocą 4 zmiennych:
+
+* cena – cena danego telefonu (w PLN);
+* pamiec – ilość pamięci w danym telefonie (w GB);
+* PPI – liczba pikseli przypadająca na cal długości, określa rozdzielczość;
+* lcd – zmienna binarna, przyjmuje wartość 1 jeśli ekran jest ekranem typu LCD, 0 – jeśli inny.
+
+Dane zostały zostały zebrane w dniu 24 maja 2022 roku z dwóch stron internetowych:
+
+* https://www.x-kom.pl/
+zmienne: cena, pamiec;
+* https://phonesdata.com/pl/
+zmienne: PPI, lcd
+
+Przy gromadzeniu danych odnośnie ceny smartfonów nie uwzględniono akcji promocyjnych sklepu dotyczących niektórych z badanych urządzeń.
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+set.seed(7)
+
+dane <- read.csv('MB_2_dane.csv', sep = ';')
+dane[,1:3] <- log(dane[,1:3])
+
+dane0 <- read.csv('MB_2_dane0.csv', sep = ';')
+dane0[,1:3] <- log(dane0[,1:3])
+
+#dane <- dane[16:80,] # przy ucięciu początkowych 15 danych mamy normalność reszt modelu 
+index = sort(sample(nrow(dane), 5))
+dane_testowe <- dane[index,]
+dane <- dane[-index,]
+```
+
+# Parametry rozkładu a priori
+
+Rozkład _a priori_ to rozkład parametrów przyjęty przed rozpocząciem badania i prezentuje wstępną wiedzę o badanym zjawisku. W związku z tym zdecydowano się na wykorzystanie modelu stworzonego 2 lata temu w oparciu o te same zmienne objaśniające. Wartości zmiennych cena, pamięć, PPI były w tym modelu zlogarytmowane.   
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+# ------------------------ MNK - wcześniejsze badania ------------------
+model_mnk0 <- lm(cena ~ ., data = dane0)
+#summary(model_mnk0)
+
+coef0 <- round(coeftest(model_mnk0), 4)
+coef0 <- coef0[1:4,1:4]
+coef0 <- coef0[,-3]
+colnames(coef0) <- c('Wartość wyestymowanego parametru', 'Błąd standardowy', 'P-value testu istotności parametru')
+rownames(coef0) <- c("$stała$", "$pamięć$", '$PPI$', '$lcd$')
+
+coef0 %>% kbl() %>% kable_styling() %>%
+  footnote(general = "Tab. 1.: Wartości wyestymowanych parametrów modelu MNK sprzed 2 lat wraz z oceną ich istotności",
+           general_title = "",
+           footnote_as_chunk = T, title_format = c("italic"))
+```
+Model przyjmuje postać:
+$$Y = -1,94 + 0,48~X_1+1,25~X_2 - 0,36~X_3$$
+gdzie:
+
++ $Y$ - zmienna objaśniana - cena (zlogarytmowana),
++ $X_1$ - zmienna pamięć (zlogarytmowana),
++ $X_2$ - zmienna PPI (zlogarytmowana),
++ $X_3$ - zmienna lcd.
+
+Można zauważyć, że wszystkie zmienne modelu są statystycznie istotne, a zatem metodami bayesowskimi będziemy szacować wszystkie trzy parametry: pamiec, PPI i lcd.
+
+Jeżeli przyjmiemy następujące rozkłady _a priori_: 
+$$\pi(\sigma^2) \sim IG(\frac{\alpha_0}{2},\frac{\delta_0}{2})$$
+czyli $\sigma^2$ ma rozkład odwrotny gamma z parametrami $\frac{\alpha_0}{2}$ i $\frac{\delta_0}{2}$,
+$$\pi(\beta|\sigma^2) \sim N_k(\beta_0,\sigma^2\Sigma_0)$$
+$\beta_0$ ma $k$-wymiarowy rozkład normalny warunkowy względem $\sigma^2$
+
+to:
+
++ $\beta_0$ - wektor oszacowany MNK we wcześniejszym badaniu,
++ $\Sigma_0$ - macierz $(X^{T}X)^{-1}$ uzyskanej z wcześniejszych badań,
++ $\alpha_0$ - liczba stopni swobody $(n-k)$ wcześniejszych badań,
++ $\delta_0$ - suma kwadratów reszt z wcześniejszego badania.
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+# ------------------------ a priori ----------------------------------
+dane0_X <- as.matrix(cbind(rep(1, nrow(dane0)),  dane0[,2:4]))
+
+alfa0 <- model_mnk0$df.residual
+beta0 <- as.matrix(model_mnk0$coefficients)
+delta0 <- sum(model_mnk0$residuals^2)
+sigma0 <- solve(t(dane0_X) %*% dane0_X)
+
+a_priori_a_d <- cbind(alfa0, delta0)
+rownames(a_priori_a_d) <- c('Wartość parametru')
+colnames(a_priori_a_d) <- c("$\\alpha_0$", "$\\delta_0$")
+
+a_priori_a_d %>% kbl() %>% kable_styling() %>%
+  footnote(general = "Tab. 2.: Wartości $\\alpha_0$ i $\\delta_0$ rozkładu a priori",
+           general_title = "",
+           footnote_as_chunk = T, title_format = c("italic"))
+
+a_priori_beta <- as.data.frame(beta0)
+rownames(a_priori_beta) <- c("$stała$", "$pamięć$", '$PPI$', '$lcd$')
+colnames(a_priori_beta) <- c("$\\beta_0$")
+
+a_priori_beta %>% kbl() %>% kable_styling() %>%
+  footnote(general = "Tab. 3.: Wartość $\\beta_0$ rozkładu a priori",
+           general_title = "",
+           footnote_as_chunk = T, title_format = c("italic"))
+
+a_priori_sigma <- as.data.frame(sigma0)
+rownames(a_priori_sigma) <- c("$X_0$", "$X_1$", '$X_2$', '$X_3$')
+colnames(a_priori_sigma) <- c("$X_0$", "$X_1$", '$X_2$', '$X_3$')
+
+a_priori_sigma %>% kbl() %>% kable_styling() %>%
+  footnote(general = "Tab. 4.: Wartość $\\Sigma_0$ rozkładu a priori",
+           general_title = "",
+           footnote_as_chunk = T, title_format = c("italic"))
+```
+
+# Model MNK
+
+Następnym etapem jest estymacja modelu regresji wielorakiej za pomocą Metody Najmniejszych Kwadratów. Zdecydowano się również na zlogarytmowanie zmiennych: cena, pamięć i lcd. 
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+# ------------------------ MNK -----------------------------------------
+model_mnk <- lm(cena ~ ., data = dane)
+#summary(model_mnk)
+
+coef <- round(coeftest(model_mnk), 4)
+coef <- coef[1:4,1:4]
+coef <- coef[,-3]
+colnames(coef) <- c('Wartość wyestymowanego parametru', 'Błąd standardowy', 'P-value testu istotności parametru')
+rownames(coef) <- c("$stała$", "$pamięć$", '$PPI$', '$lcd$')
+
+coef %>% kbl() %>% kable_styling() %>%
+  footnote(general = "Tab. 5.: Wartości wyestymowanych parametrów modelu MNK wraz z oceną ich istotności",
+           general_title = "",
+           footnote_as_chunk = T, title_format = c("italic"))
+```
+Model przyjmuje postać:
+$$Y = -2,86 + 0,49~X_1+1,42~X_2 - 0,25~X_3$$
+gdzie:
+
++ $Y$ - zmienna objaśniana - cena (zlogarytmowana),
++ $X_1$ - zmienna pamięć (zlogarytmowana),
++ $X_2$ - zmienna PPI (zlogarytmowana),
++ $X_3$ - zmienna lcd.
+
+Wszystkie zmienne modelu są istotne statystycznie na przyjętym poziomie istotności 5%. Interpretacja parametrów:
+
+* wzrost pamięci o 1% powoduje wzrost ceny o około 0,49%, ceteris paribus;
+* wzrost PPI o 1% powoduje wzrost ceny o około 1,42%, ceteris paribus;
+* cena telefonu z ekranem lcd jest niższa o okolo 0,25 jednostki, ceteris paribus.
+
+## Weryfikacja modelu
+Normalność reszt, test Shapiro-Wilka. Hipotezy:
+
+<center>$H_0:$ reszty modelu mają rozkład normalny</center>
+
+<center>$H_1:$ reszty modelu nie mają rozkładu normalnego</center>
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+#shapiro.test(model_mnk$residuals)
+
+test_SW  <- as.data.frame((shapiro.test(model_mnk$residuals))$p.value)
+colnames(test_SW ) <- c('Test Shapiro-Wilka')
+rownames(test_SW ) <- c('P-value')
+
+test_SW  %>% kbl() %>% kable_styling() %>%
+  footnote(general = "Tab. 6.: P-value dla testu normalności Shapiro-Wilka",
+           general_title = "",
+           footnote_as_chunk = T, title_format = c("italic"))
+```
+Otrzymane p-value powyżej przyjętego poziomu istotności wskazuje na brak podstaw do odrzucenia hipotezy zerowej. Reszty modelu mają rozkład normalny. 
+
+Homostekastyczność, test Breuscha-Pagana. Hipotezy:
+
+<center>$H_0:$ reszty modelu są homoskedastyczne</center>
+
+<center>$H_1:$ reszty modelu są heteroskedastyczne</center>
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+#bptest(model_mnk)
+
+test_BP  <- as.data.frame((bptest(model_mnk))$p.value)
+colnames(test_BP) <- c('Test Breuscha-Pagana')
+rownames(test_BP) <- c('P-value')
+
+test_BP  %>% kbl() %>% kable_styling() %>%
+  footnote(general = "Tab. 7.: P-value dla testu jednorodności wariancji Breuscha-Pagana",
+           general_title = "",
+           footnote_as_chunk = T, title_format = c("italic"))
+```
+P-value większe niż 0.05 nie daje podstaw do odrzucenia hipotezy zerowej. Reszty modelu są homoskedastyczne.
+
+Testu na autokorelację reszt nie przeprowadzono z uwagi na wykorzystanie w badaniu danych przekrojowych. Zjawisko autokorelacji polega na zależności bieżących wartości 
+składnika losowego od wartości przeszłych i dotyczy szeregów czasowych.
+
+Model można uznać za prawidłowy i na jego podstawie wyznaczyć paramtery rozkładu _a posteriori_.
+
+# Parametry rozkładu a posteriori
+Rozkład _a posteriori_ stanowi modyfikacje rozkładu _a priori_ po uwzględnieniu drugiej części danych, które służą aktualizacji wiedzy o rozkładzie parametrów.
+
+Rozkład _a posteriori_ jest rozkładem normalnym-odwrotnym gamma z następującymi parametrami:
+
+$\Sigma_1 = ((X^{T}X)^{-1} +\Sigma_0^{-1})^{-1}$  
+$\beta_1 = \Sigma_1(X^TY + \Sigma_0^{-1}\beta_0)$  
+$\alpha_1 = \alpha_0 + n$  
+$\delta_1 = \delta_0 + Y^TY - \beta_1^T\Sigma_1^{_1}\beta_1 + \beta_0^T\Sigma_0^{_1}\beta_0$  
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+# ------------------------ a posteriori --------------------------------
+dane_X <- as.matrix(cbind(rep(1, nrow(dane)),  dane[,2:4]))
+dane_Y <- as.matrix(dane[,1])
+
+sigma1 <- solve(t(dane_X)%*%dane_X + solve(sigma0))
+beta1 <- sigma1%*%(t(dane_X)%*%dane_Y + solve(sigma0)%*%beta0)
+alfa1 <- alfa0 + nrow(dane)
+delta1 <- delta0 + t(dane_Y)%*%dane_Y - t(beta1)%*%solve(sigma1)%*% beta1 + t(beta0)%*%solve(sigma0)%*%beta0
+
+a_post_a_d <- cbind(alfa1, delta1)
+rownames(a_post_a_d) <- c('Wartość parametru')
+colnames(a_post_a_d) <- c("$\\alpha_1$", "$\\delta_1$")
+
+a_post_a_d %>% kbl() %>% kable_styling() %>%
+  footnote(general = "Tab. 8.: Wartości $\\alpha_1$ i $\\delta_1$ rozkładu a posteriori",
+           general_title = "",
+           footnote_as_chunk = T, title_format = c("italic"))
+
+a_post_beta <- as.data.frame(beta1)
+rownames(a_post_beta) <- c("$stała$", "$pamięć$", '$PPI$', '$lcd$')
+colnames(a_post_beta) <- c("$\\beta_1$")
+
+a_post_beta %>% kbl() %>% kable_styling() %>%
+  footnote(general = "Tab. 9.: Wartość $\\beta_1$ rozkładu a posteriori",
+           general_title = "",
+           footnote_as_chunk = T, title_format = c("italic"))
+
+a_post_sigma <- as.data.frame(sigma1)
+rownames(a_post_sigma) <- c("$X_0$", "$X_1$", '$X_2$', '$X_3$')
+colnames(a_post_sigma) <- c("$X_0$", "$X_1$", '$X_2$', '$X_3$')
+
+a_post_sigma %>% kbl() %>% kable_styling() %>%
+  footnote(general = "Tab. 10.: Wartość $\\Sigma_1$ rozkładu a posteriori",
+           general_title = "",
+           footnote_as_chunk = T, title_format = c("italic"))
+```
+
+# Wyznaczenie rozkładów brzegowych
+Poprzednie obliczenia pozwoliły na uzyskanie łącznego rozkładu _a posteriori_ parametrów $(\beta, \sigma^2)$. Rozkłady brzegowe pozwalają na wyznaczenie rozkładów rozłącznych dla $\sigma^2$ oraz każdego $\beta$.
+
+Rozkłady brzegowe _a priori_ i _a posteriori_ przedstawiono na wspólnych wykresach w celu porównania.
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, out.width="50%"}
+n <- 1000000 
+
+df1 <- data.frame(
+  Rozklad=factor(rep(c("a priori", "a posteriori"), each=n)),
+  wartosc=c(rt.scaled(n, mean = beta0[1], sd = as.vector((delta0/alfa0) * sigma0[1,1]), df = alfa0),
+                 rt.scaled(n, mean = beta1[1], sd = as.vector((delta1/alfa1) * sigma1[1,1]), df = alfa1)))
+mu1 <- ddply(df1, "Rozklad", summarise, grp.mean=mean(wartosc))
+
+p1 <- ggplot(df1, aes(x=wartosc, fill=Rozklad)) +
+  geom_density(alpha=0.4) + 
+  geom_vline(data=mu1, aes(xintercept=grp.mean, color=Rozklad), linetype="dashed") +
+  theme_bw() +
+  ylab('') +
+  ggtitle(expression("Rozkłady stałej"))
+p1
+
+df1 <- data.frame(
+  Rozklad=factor(rep(c("a priori", "a posteriori"), each=n)),
+  wartosc=c(rt.scaled(n, mean = beta0[2], sd = as.vector((delta0/alfa0) * sigma0[2,2]), df = alfa0),
+                 rt.scaled(n, mean = beta1[2], sd = as.vector((delta1/alfa1) * sigma1[2,2]), df = alfa1)))
+mu1 <- ddply(df1, "Rozklad", summarise, grp.mean=mean(wartosc))
+
+p1 <- ggplot(df1, aes(x=wartosc, fill=Rozklad)) +
+  geom_density(alpha=0.4) + 
+  geom_vline(data=mu1, aes(xintercept=grp.mean, color=Rozklad), linetype="dashed") +
+  theme_bw() +
+  ylab('') +
+  ggtitle(expression("Rozkłady parametru przy zmiennej pamięć"))
+p1
+
+df1 <- data.frame(
+  Rozklad=factor(rep(c("a priori", "a posteriori"), each=n)),
+  wartosc=c(rt.scaled(n, mean = beta0[3], sd = as.vector((delta0/alfa0) * sigma0[3,3]), df = alfa0),
+                 rt.scaled(n, mean = beta1[3], sd = as.vector((delta1/alfa1) * sigma1[3,3]), df = alfa1)))
+mu1 <- ddply(df1, "Rozklad", summarise, grp.mean=mean(wartosc))
+
+p1 <- ggplot(df1, aes(x=wartosc, fill=Rozklad)) +
+  geom_density(alpha=0.4) + 
+  geom_vline(data=mu1, aes(xintercept=grp.mean, color=Rozklad), linetype="dashed") +
+  theme_bw() +
+  ylab('') +
+  ggtitle(expression("Rozkłady parametru przy zmiennej PPI"))
+p1
+
+df1 <- data.frame(
+  Rozklad=factor(rep(c("a priori", "a posteriori"), each=n)),
+  wartosc=c(rt.scaled(n, mean = beta0[4], sd = as.vector((delta0/alfa0) * sigma0[4,4]), df = alfa0),
+                 rt.scaled(n, mean = beta1[4], sd = as.vector((delta1/alfa1) * sigma1[4,4]), df = alfa1)))
+mu1 <- ddply(df1, "Rozklad", summarise, grp.mean=mean(wartosc))
+
+p1 <- ggplot(df1, aes(x=wartosc, fill=Rozklad)) +
+  geom_density(alpha=0.4) + 
+  geom_vline(data=mu1, aes(xintercept=grp.mean, color=Rozklad), linetype="dashed") +
+  theme_bw() +
+  ylab('') +
+  ggtitle(expression("Rozkłady parametru przy zmiennej lcd"))
+p1
+
+```
+
+Na wykresach widać, że rozkłady parametrów _a posterioi_ są znacznie węższe od rozkładów _a priori_. Wykresy stałej oraz parametru przy zmiennej _PPI_ oscylują wokół podobnych wartości, natomiast parametry zmiennych _pamięć_ i _lcd_ są różne w przypadku rozkładu _a priori_ i _a posteriori_.
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+a_posteriori <- as.data.frame(matrix(NA, nrow = n, ncol = ncol(dane)))
+
+for(i in 1:(ncol(a_posteriori)))
+{
+  a_posteriori[,i] <- rt.scaled(n, mean = beta1[i], sd = as.vector((delta1/alfa1) * sigma1[i,i]), df = alfa1)
+}
+```
+
+
+# Bayesowskie estymatory parametrów
+Estymatory bayesowskie parametrów modelu są wartościami oczekiwanymi obliczonymi z wykorzystaniem rozkładku _a posteriori_.
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+# ------------------------ bayesowskie estymatory parametrów modelu ---------------------------
+
+estymator_bayesowski <- colMeans(a_posteriori)
+
+opt_bayes <- as.data.frame(apply(a_posteriori, 2, mean))
+opt_bayes_sd <- as.data.frame(apply(a_posteriori, 2, sd))
+
+rownames(opt_bayes) <- c("$stała$", "$pamięć$", '$PPI$', '$lcd$')
+colnames(opt_bayes) <- c("Estymator bayesowski")
+
+opt_bayes %>% kbl() %>% kable_styling() %>%
+  footnote(general = "Tab. 11.: Estymatory bayesowskie parametrów modelu MNK",
+           general_title = "",
+           footnote_as_chunk = T, title_format = c("italic"))
+
+```
+
+Model przyjmuje postać:
+$$Y = -2,34 + 0,52~X_1+1,30~X_2 - 0,30~X_3$$
+gdzie:
+
++ $Y$ - zmienna objaśniana - cena (zlogarytmowana),
++ $X_1$ - zmienna pamięć (zlogarytmowana),
++ $X_2$ - zmienna PPI (zlogarytmowana),
++ $X_3$ - zmienna lcd.
+
+Interpretacja parametrów:
+
+* wzrost pamięci o 1% powoduje wzrost ceny o około 0,52%, ceteris paribus;
+* wzrost PPI o 1% powoduje wzrost ceny o około 1,30%, ceteris paribus;
+* cena telefonu z ekranem lcd jest niższa o okolo 0,30 jednostki, ceteris paribus.
+
+Dla przypomnienia, model oszacowany MNK przyjmuje postać:
+$$Y = -2,86 + 0,49~X_1+1,42~X_2 - 0,25~X_3$$
+
+Warto zauważyć, iż oszacowania parametrów obu modeli są dosyć podobne. Ponadto znak przy parametrze dla danej zmiennej jest taki sam w obu modelach. Oznacza to, iż na podstawie obu modeli można wyciągnąć ten sam wniosek, czy wraz ze wzrostem danej zmiennej objaśniającej zmniejsza się lub zwiększa się wartość zmiennej objaśnianej. 
+
+Jedną z metod weryfikacji wyznaczonych estymatorów bayesowskich jest wyznaczenie 95% przedziałów  ufności największej gęstości _a posteriori_ czyli HDPI (Highest Posterior Density Interval).
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+# HPDI
+hdi_df <- hdi(a_posteriori$V1)
+hdi_df <- rbind(hdi_df, hdi(a_posteriori$V2))
+hdi_df <- rbind(hdi_df, hdi(a_posteriori$V3))
+hdi_df <- rbind(hdi_df, hdi(a_posteriori$V4))
+hdi_df <- hdi_df[,-1]
+colnames(hdi_df) <- c('Dolna granica HPDI', 'Górna granica HPDI')
+rownames(hdi_df) <- c("$stała$", "$pamięć$", '$PPI$', '$lcd$')
+
+hdi_df %>% kbl() %>% kable_styling() %>%
+  footnote(general = "Tab. 12.: HPDI",
+           general_title = "",
+           footnote_as_chunk = T, title_format = c("italic"))
+```
+Przedziały HPDI dla zmiennych objaśniających nie zawierają 0 - oznacza to, że wszystkie analizowane zmienne można uznać za statystycznie istotne. Pokrywa się to z wynikiem otrzymanym dzięki Klasycznej Metodzie Najmniejszych Kwadratów.
+
+Następnie wyznaczono przedziały ufności dla modelu MNK.
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+# Prziedziały ufności dla MNK
+ufnosc <- as.data.frame(confint(model_mnk, level = 0.95))
+colnames(ufnosc) <- c("Dolna granica przedziału ufności", "Górna granica przedziału ufności")
+rownames(ufnosc) <- c("$stała$", "$pamięć$", '$PPI$', '$lcd$')
+
+ufnosc %>% kbl() %>% kable_styling() %>%
+  footnote(general = "Tab. 13.: Przedziały ufności modelu MNK",
+           general_title = "",
+           footnote_as_chunk = T, title_format = c("italic"))
+```
+
+Przedziały ufności dla obu metod różnią się od siebie, jednak różnice te nie są znaczące. W przypadku wszystkich składowych modelu przedziały HPDI mają węższy zakres.
+
+
+# Rozkłady predykcyjne
+W podejściu bayesowskich prognozowane wartości są zmiennymi losowymi, dla których należy wyznaczyć rozkład predykcyjny. Znana funkcja gęstości _a posteriori_ parametrów modelu i $y_{\tau}$ pozwalają na wyznaczenie  $m$-wymiarowego rozkładu predykcyjnego.
+
+$$f(y_{\tau}|y)\sim t_m(x_{\tau}\beta_1,~\frac{\delta_1}{\alpha_1}[I_m+x_{\tau}\Sigma_1x_{\tau}^T],~\alpha_1)$$
+gdzie:
+
+$\beta_1$, $\Sigma_1$, $\alpha_1$, $\delta_1$ są parametrami rozkładu _a posteriori_, a $I_m$ jest $m$-wymiarową macierzą jednostkową.
+
+Z wykorzystaniem wcześniej wspomnianego rozkładu wyznaczono prognozy, których wartości oczekiwane przedstawiono w tabeli poniżej, a następnie porównano je z prognozami uzyskanymi metodą klasyczną.
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+# ------------------------ rozkłady predykcyjne dla zbioru testowego ---------------------------
+x_tau <- as.matrix(cbind(rep(1, nrow(dane_testowe)), dane_testowe[,2:4]))
+  
+a_posteriori_prognoza <- as.data.frame(matrix(NA, nrow = n, ncol = nrow(dane_testowe)))
+p1 <- diag(1, nrow(dane_testowe)) +  x_tau%*%sigma1%*%t(x_tau) 
+for(i in 1:(nrow(dane_testowe))){
+  a_posteriori_prognoza[,i] <- rt.scaled(n, 
+                                         mean = (x_tau %*% as.matrix(beta1))[i], 
+                                         sd = as.vector((delta1/alfa1) * p1[i,i]), 
+                                         df = alfa1)
+}
+
+ex_prognoza <- as.data.frame(colMeans(a_posteriori_prognoza))
+colnames(ex_prognoza) <- c("Wartość prognozy")
+rownames(ex_prognoza) <- c("I", "II", "III", "IV", "V")
+
+# hdi
+hdi_prognoza <- hdi(a_posteriori_prognoza$V1)
+hdi_prognoza <- rbind(hdi_prognoza, hdi(a_posteriori_prognoza$V2))
+hdi_prognoza <- rbind(hdi_prognoza, hdi(a_posteriori_prognoza$V3))
+hdi_prognoza <- rbind(hdi_prognoza, hdi(a_posteriori_prognoza$V4))
+hdi_prognoza <- rbind(hdi_prognoza, hdi(a_posteriori_prognoza$V5))
+hdi_prognoza <- hdi_prognoza[,-1]
+colnames(hdi_prognoza) <- c('Dolna granica HPDI', 'Górna granica HPDI')
+
+hdi_prognoza <- cbind(ex_prognoza, hdi_prognoza)
+
+hdi_prognoza %>% kbl() %>% kable_styling() %>%
+  footnote(general = "Tab. 14.: Prognoza - wnioskowanie bayesowskie",
+           general_title = "",
+           footnote_as_chunk = T, title_format = c("italic"))
+
+```
+
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+# Sposób klasyczny - z modelu MNK
+mnk_prognoza <- predict(model_mnk, dane_testowe[,2:4], interval = "confidence")
+rownames(mnk_prognoza) <- c("I", "II", "III", "IV", "V")
+colnames(mnk_prognoza) <- c("Wartość prognozy", "Dolna granica przedziału ufności", "Górna granica przedziału ufności")
+
+mnk_prognoza %>% kbl() %>% kable_styling() %>%
+  footnote(general = "Tab. 15.: Wartości prognozy z modelu MNK oraz przedziały ufności",
+           general_title = "",
+           footnote_as_chunk = T, title_format = c("italic"))
+```
+
+Wartości wyznaczonych prognoz przedstawiono również w sumarycznej tabeli uwzględniajacej wartości rzeczywiste:
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+porownanie <- cbind(dane_testowe[,1], ex_prognoza[,1], mnk_prognoza[,1])
+colnames(porownanie) <- c('Wartość rzeczywista', 'Prognoza bayesowska','Prognoza MNK')
+
+porownanie %>% kbl() %>% kable_styling() %>%
+  footnote(general = "Tab. 16.: Porównanie wartości rzeczywistych i otrzymanych prognoz",
+           general_title = "",
+           footnote_as_chunk = T, title_format = c("italic"))
+
+bledy <- as.data.frame(matrix(NA, 2, 3))
+colnames(bledy) <- c('MAE', 'MSE', 'RMSE')
+rownames(bledy) <- c('KMNK', 'model bayesowski')
+bledy[1,1] <- mae(dane_testowe$cena, c(predict(model_mnk, dane_testowe[,2:4])))
+bledy[2,1] <- mae(dane_testowe$cena, colMeans(a_posteriori_prognoza))
+
+bledy[1,2] <- mse(dane_testowe$cena, c(predict(model_mnk, dane_testowe[,2:4])))
+bledy[2,2] <- mse(dane_testowe$cena, colMeans(a_posteriori_prognoza))
+
+bledy[1,3] <- rmse(dane_testowe$cena, c(predict(model_mnk, dane_testowe[,2:4])))
+bledy[2,3] <- rmse(dane_testowe$cena, colMeans(a_posteriori_prognoza))
+
+bledy %>% kbl() %>% kable_styling() %>%
+  footnote(general = "Tab. 17.: Błędy prognoz",
+           general_title = "",
+           footnote_as_chunk = T, title_format = c("italic"))
+
+```
+
+Zestawienie pokazuje, że wyniki uzyskane obiema metoda dają podobne błędy predykcji. Średni absoltuny błąd predykcji jest mniejszy dla wyników uzyskanych za pomocą estymacji bayesowskiej, z kolei błąd średniokwadratowy (bardziej wyczulony na wartości skrajne) za lepszy wskazał model uzyskany KMNK. 
+
+# Porównywanie modeli
+
+Podejście bayesowskie umożliwia porównywanie dwóch modeli (bez i z restrykcjami) w celu oceny, który z nich jest lepszy. Aby porównać dwa modele $M_1$ i $M_2$ stosuje się iloraz szans a posteriori:
+$$ R_{12} =  \frac{P(y|M_1)}{P(y|M_2)} * \frac{P(M_1)}{P(M_2)}$$
+
+Następnie w oparciu o statystykę $log_{10}R_{12}$ ocenia się, który model jest lepszy. Jeżeli $log_{10}R_{12} > 2$, to model $M_1$ jest zdecydowanie lepszy niż $M_2$. 
+
+## Istotność zmiennej pamięć
+
+Niech modelem $M_1$ będzie model zawierający wszystkie trzy zmienne objaśniające, a modelem $M_2$ będzie model ze zmiennymi _PPI_ orax _lcd_. Zostanie przeprowadzony test restrykcji sprawdzający istotność zmiennej _pamięć_.
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+# ------------------------ istotność jednej zmiennej X1 (pamiec) ---------------------------
+# model a priori dla modelu z restrykcjami R1
+model_mnk0_R1 <- lm(cena ~ PPI + lcd, data = dane0)
+#summary(model_mnk0_R1)
+
+dane0_X_R1 <- as.matrix(cbind(rep(1, nrow(dane0)),  dane0[,3:4]))
+alfa0_R1 <- model_mnk0_R1$df.residual
+beta0_R1 <- as.matrix(model_mnk0_R1$coefficients)
+delta0_R1 <- sum(model_mnk0_R1$residuals^2)
+sigma0_R1 <- solve(t(dane0_X_R1) %*% dane0_X_R1)
+
+model_mnk_R1 <- lm(cena ~ PPI + lcd, data = dane)
+#summary(model_mnk_R1)
+
+dane_X_R1 <- as.matrix(cbind(rep(1, nrow(dane)),  dane[,3:4]))
+dane_Y_R1 <- as.matrix(dane[,1])
+sigma1_R1 <- solve(t(dane_X_R1)%*%dane_X_R1 + solve(sigma0_R1))
+beta1_R1 <- sigma1_R1%*%(t(dane_X_R1)%*%dane_Y_R1 + solve(sigma0_R1)%*%beta0_R1)
+alfa1_R1 <- alfa0_R1 + nrow(dane)
+delta1_R1 <- delta0_R1 + t(dane_Y_R1)%*%dane_Y_R1 - t(beta1_R1)%*%solve(sigma1_R1)%*% beta1_R1 + 
+  t(beta0_R1)%*%solve(sigma0_R1)%*%beta0_R1
+
+statystyka_R1 = sqrt((det(sigma1)*det(sigma0_R1)) / (det(sigma1_R1)*det(sigma0))) * 
+  (delta0^(alfa0/2) / delta1^(alfa1/2)) / (delta0_R1^(alfa0_R1/2) / delta1_R1^(alfa1_R1/2)) *
+  (gamma(alfa1/2) / gamma(alfa0/2)) / (gamma(alfa1_R1/2) / gamma(alfa0_R1/2))
+
+restrykcje_R1 <- as.data.frame(log(statystyka_R1, 10))
+colnames(restrykcje_R1) <- c('Logarytm statystyki $R_{12}$')
+
+restrykcje_R1  %>% kbl() %>% kable_styling() %>%
+  footnote(general = "Tab. 18.: Obliczona statystyka testu restrykcji: istotność zmiennej pamięć",
+           general_title = "",
+           footnote_as_chunk = T, title_format = c("italic"))
+# model bez restrykcji jest dużo lepszy
+```
+
+Logarytm statystyki większy niż 2 wzkazuje na interpretację rozstrzygającą. Oznacza to, że model bez restrykcji jest lepszy niż model z restrykcjami. Zmienna _pamięć_ jest zmienną istotną.
+
+Istotność zmiennej _pamięć_ weryfikowano również testem t-Studenta (dla modelu oszacowanego za pomocą MNK). Hipotezy:
+
+<center>$H_0:$ $\alpha_j = 0$ (zmienna nieistotna)</center>
+<center>$H_1:$ $\alpha_j \neq 0$  (zmienna istotna)</center>
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+test_t <- as.data.frame(summary(model_mnk)$coefficients[,4])
+test_t <- round(test_t, 4)
+colnames(test_t) <- c('P-value testu t-Studenta')
+rownames(test_t) <- c("$stała$", "$pamięć$", '$PPI$', '$lcd$')
+
+test_t %>% kbl() %>% kable_styling() %>%
+  footnote(general = "Tab. 19.: Wartości testu t-Studenta",
+           general_title = "",
+           footnote_as_chunk = T, title_format = c("italic"))
+```
+
+Na podstawie testu istotności oszacowanych parametrów można stwierdzić, iż zmienna _pamięć_ jest istotna statystycznie ponieważ ma p-value mniejsze niż przyjęty poziom istotności. Jest to wynik zgodny z wcześniej przeprowadzonym testem restrykcji.
+
+## Łączna istotność zmiennych pamięć i PPI 
+
+Niech modelem $M_1$ będzie model zawierający wszystkie trzy zmienne objaśniające, a modelem $M_2$ będzie model ze zmienną _lcd_. Zostanie przeprowadzony test restrykcji sprawdzający łączną istotność zmiennych _pamięć_ i _PPI_.
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+# ------------------------ istotność dwóch zmiennych X1 i X2(pamiec i PPI) ---------------------------
+
+# model a priori dla modelu z restrykcjami R2
+model_mnk0_R2 <- lm(cena ~ lcd, data = dane0)
+#summary(model_mnk0_R2)
+
+dane0_X_R2 <- as.matrix(cbind(rep(1, nrow(dane0)),  dane0[,4]))
+alfa0_R2 <- model_mnk0_R2$df.residual
+beta0_R2 <- as.matrix(model_mnk0_R2$coefficients)
+delta0_R2 <- sum(model_mnk0_R2$residuals^2)
+sigma0_R2 <- solve(t(dane0_X_R2) %*% dane0_X_R2)
+
+model_mnk_R2 <- lm(cena ~ lcd, data = dane)
+#summary(model_mnk_R2)
+
+dane_X_R2 <- as.matrix(cbind(rep(1, nrow(dane)),  dane[,4]))
+dane_Y_R2 <- as.matrix(dane[,1])
+sigma1_R2 <- solve(t(dane_X_R2)%*%dane_X_R2 + solve(sigma0_R2))
+beta1_R2 <- sigma1_R2%*%(t(dane_X_R2)%*%dane_Y_R2 + solve(sigma0_R2)%*%beta0_R2)
+alfa1_R2 <- alfa0_R2 + nrow(dane)
+delta1_R2 <- delta0_R2 + t(dane_Y_R2)%*%dane_Y_R2 - t(beta1_R2)%*%solve(sigma1_R2)%*% beta1_R2 + 
+  t(beta0_R2)%*%solve(sigma0_R2)%*%beta0_R2
+
+statystyka_R2 = sqrt((det(sigma1)*det(sigma0_R2)) / (det(sigma1_R2)*det(sigma0))) * 
+  (delta0^(alfa0/2) / delta1^(alfa1/2)) / (delta0_R2^(alfa0_R2/2) / delta1_R2^(alfa1_R2/2)) *
+  (gamma(alfa1/2) / gamma(alfa0/2)) / (gamma(alfa1_R2/2) / gamma(alfa0_R2/2))
+
+restrykcje_R2 <- as.data.frame(log(statystyka_R2, 10))
+colnames(restrykcje_R2) <- c('Logarytm statystyki $R_{12}$')
+
+restrykcje_R2  %>% kbl() %>% kable_styling() %>%
+  footnote(general = "Tab. 20.: Obliczona statystyka testu restrykcji: łączna istotność zmiennych pamięć i PPI",
+           general_title = "",
+           footnote_as_chunk = T, title_format = c("italic"))
+# model bez restrykcji jest dużo lepszy
+
+```
+
+
+Logarytm statystyki większy niż 2 wzkazuje na interpretację rozstrzygającą. Oznacza to, że model bez restrykcji jest lepszy niż model z restrykcjami. Zmienne _PPI_ i _pamiec_ są zmiennymi istotnymi.
+<br/>Przeprowadzony test porównano również z testem F, którego statystyka ma postać:
+
+$$F=\frac{RRSS-URSS}{URSS}\cdot\frac{n-k}{m}$$
+gdzie:
+
++ $RRSS$ - suma kwadratów reszt modelu z nałożonymi restrykcjami,
++ $URSS$ - suma kwadratów reszt modelu bez restrykcji.
+
+Hipotezy testu:
+$$H_0:R\beta=q$$
+$$H_1:R\beta\neq q$$
+
+Ich weryfikacja pozwala rozstrzygnąc czy nałożone restrykcje są zasadne.
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, include=FALSE}
+#summary(model_mnk)
+#summary(model_mnk_R2)
+linearHypothesis(model_mnk, c("pamiec=0", "PPI=0"))
+
+RSSS = sum(model_mnk_R2$residuals^2)
+URSS = sum(model_mnk$residuals^2)
+F_statystyka = ((RSSS-URSS)/URSS)*((nrow(dane)-3-1)/2)
+
+test_F  <- as.data.frame(F_statystyka)
+colnames(test_F) <- c('Test F')
+rownames(test_F) <- c('P-value')
+
+test_F  %>% kbl() %>% kable_styling() %>%
+  footnote(general = "Tab. 21.: P-value dla testu F",
+           general_title = "",
+           footnote_as_chunk = T, title_format = c("italic"))
+
+# odrzucamy H0, restrykcje są zbędne
+
+```
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+test_F  <- as.data.frame(0)
+colnames(test_F) <- c('Test F')
+rownames(test_F) <- c('P-value')
+
+test_F  %>% kbl() %>% kable_styling() %>%
+  footnote(general = "Tab. 22.: P-value dla testu F",
+           general_title = "",
+           footnote_as_chunk = T, title_format = c("italic"))
+
+# odrzucamy H0, restrykcje są zbędne
+```
+
+P-value wynosi 0 (w zaokrągleniu do części dziesięciotysięcznych), występują podstawy do odrzucenia hipotezy zerowej, co oznacza, że restrykcje są zbędne. Wynik potwierdził wniosek z poprzedniego testu.
+
+# Podsumowanie
+
+Parametrów w telefonie jest kilkadziesiąt, różnią się specyfikacją, dlatego problem prognozowania cen smartfonów jest trudny. Nie tylko dane techniczne odgrywają istotną rolę w kształtowaniu ceny, a inne cechy są trudno mierzalne. Wiele osób używa sformułowania „płacenie za markę”, czyli domniemane dodatkowe pieniądze, które trzeba dopłacić przy zakupie urządzenia topowego producenta – co jest trudne do przedstawienia wartościowo. Ceny w Polsce są również uzależnione od warunków celno-skarbowych. Wbrew pozorom istnieje szereg czynników, które wpływają na ceny smartfonów w Polsce i nie są to tylko parametry techniczne telefonu.
+
+W projekcie porównano podejście klasyczne reprezentowane przez Metodę Najmniejszych Kwadratów oraz podejście bayesowskie opierające się na zmiennych losowych i ich rozkładach. Mimo, iż metody mają to samo przeznaczenie trudno jednoznacznie wskazać, która z nich jest lepsza. Obie metody wskazały w przybliżeniu podobne parametry modeli, jednak w prognozach otrzymano rozbieżne wyniki. W przypadku rozszerzenia pracy w przyszłości należałoby wziąć pod uwagę większy zbiór danych, zarówno danych uczących jak i testowych. 
+
+# Bibliografia
+<ul>
+<li>Decewicz Anna, Groniowska Agnieszka,<i>"Bayesowska analiza statystyczna w badaniach koniunktury gospodarczej"</i>, Prace i Materiały Instytutu Rozwoju Gospodarczego / Szkoła Główna Handlowa, nr 70, Warszawa, 2001</li>
+<li>Materiały zamieszczone na platformie UPEL w ramach zajęć _Metody Bayesowskie_</li>
+</ul>
